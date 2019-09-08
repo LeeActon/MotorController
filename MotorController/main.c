@@ -6,8 +6,12 @@
  */ 
 
 #define F_CPU 1000000
+//#define PID_CONTROL
 //#define CAPTURE_RPM
-#define CAPTURE_PID
+//#define CAPTURE_PID
+//#define USE_RPMS
+#define USE_TICKS
+#define ENABLE_SLEEP
 
 #include <avr/io.h>
 #include <avr/interrupt.h>
@@ -17,8 +21,6 @@
 typedef uint8_t bool;
 const bool false = 0;
 const bool true = 1;
-
-#define ARRAY_COUNT(a) (sizeof(a) / sizeof(a[0]))
 
 // Pin 13 - PA0 - INPUT - GOTO_MAXIMUM_PIN
 //                Input indicating the desired position of the motor.
@@ -42,12 +44,15 @@ const bool true = 1;
 int32_t GetTimerTick();
 int32_t GetTimerTickChange(int32_t prevTick);
 bool IsTimeout(int32_t tickTimeout);
+int32_t FutureTicks(int32_t delta);
 bool ChangeMotorPower(int16_t powerChange);
 bool SetMotorPower(int16_t power);
 void SetMotorDirection(uint8_t direction);
 int16_t GetMotorRPM();
-bool MotorPIDControl();
+#if defined (PID_CONTROL)
+void MotorPIDControl();
 void ResetMotorPIDControl();
+#endif
 void SetTargetRPM(int16_t targetRPM);
 
 #define GOTO_MAXIMUM_PIN PA0
@@ -92,22 +97,16 @@ void SetTargetRPM(int16_t targetRPM);
 #error TIMER1_PRESCALE must be defined
 #endif
 
+const int32_t ticksPerMinute = 60*TicksPerSecond;
+
 // Extend TIMER1 to 32-bits by keeping track of 16-bit overflow
 volatile uint16_t tim1High = 0;
 ISR(TIM1_OVF_vect)
-{
+    {
     tim1High++;
-}
+    }
 
 int16_t overflowCount = 0;
-int32_t GetTimerTickChange(int32_t prevTick)
-{
-    return GetTimerTick() - prevTick;
-}
-bool IsTimeout(int32_t tickTimeout)
-{
-    return (GetTimerTick() >= tickTimeout) ? true : false;
-}
 int32_t GetTimerTick()
     {
     int32_t now = 0;
@@ -125,17 +124,39 @@ int32_t GetTimerTick()
         
     return now;
     }
+int32_t GetTimerTickChange(int32_t prevTick)
+{
+    return GetTimerTick() - prevTick;
+}
+bool IsTimeout(int32_t tickTimeout)
+{
+    return (GetTimerTick() >= tickTimeout) ? true : false;
+}
+int32_t FutureTicks(int32_t delta)
+{
+    return GetTimerTick() + delta;
+}
 
 // Implement a tachometer on the motor by keeping track of the number of timer1 ticks between pulses of the hall effect sensor.
 // Keep 16 values for a rolling average.
 volatile int32_t tachTickPrev = 0;
-volatile uint8_t tachTicksIndex = 0;
+volatile uint8_t tachIndex = 0;
 #define tachSampleCount 32
-volatile int32_t tachTicks[tachSampleCount] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-volatile int16_t tachTicksOverflowCount = 0;
-volatile int32_t tachTicksRollingTotal = 0;
 volatile int32_t tachCount = 0;
+volatile int16_t tachTicksOverflowCount = 0;
+
+#if defined(USE_TICKS)
+volatile int32_t tachTicks[tachSampleCount] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+volatile int32_t tachTicksRollingTotal = 0;
 volatile int32_t tachTicksRollingAverage = 0;
+#endif
+#if defined(USE_RPMS)
+volatile int16_t tachRPMs[tachSampleCount] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+volatile int32_t tachRPMsRollingTotal = 0;
+volatile int16_t tachRPMsRollingAverage = 0;
+#endif
+
+volatile int16_t EXT_INT0_ticks = 0;
 
 // ISR for Hall effect sensor on the motor.
 ISR(EXT_INT0_vect)
@@ -149,40 +170,48 @@ ISR(EXT_INT0_vect)
     tachCount++;
 
     // We keep an array of the last n tachTicks to compute a rolling average.
-    tachTicksRollingTotal -= tachTicks[tachTicksIndex];  // about to overwrite this value... remove it from the rolling total
-    tachTicks[tachTicksIndex] = tachDelta;
-    tachTicksRollingTotal += tachDelta;
     int32_t rollingCount = (tachCount < tachSampleCount) ? tachCount : tachSampleCount;
+#if defined(USE_TICKS)
+    tachTicksRollingTotal -= tachTicks[tachIndex];  // about to overwrite this value... remove it from the rolling total
+    tachTicks[tachIndex] = tachDelta;
+    tachTicksRollingTotal += tachDelta;
     tachTicksRollingAverage = (tachTicksRollingTotal / rollingCount);
-    
-    tachTicksIndex++;
+#endif
+ #if defined(USE_RPMS)
+    int16_t rpm = (int16_t)(ticksPerMinute/tachDelta);
+    tachRPMsRollingTotal -= tachRPMs[tachIndex];  // about to overwrite this value... remove it from the rolling total
+    tachRPMs[tachIndex] = rpm;
+    tachRPMsRollingTotal += rpm;
+    tachRPMsRollingAverage = (tachRPMsRollingTotal / rollingCount);
+#endif   
+    tachIndex++;
     // Wrap around at the end of the array
-    if (tachTicksIndex >= ARRAY_COUNT(tachTicks))
+    if (tachIndex >= tachSampleCount)
         {
-        tachTicksIndex = 0;
+        tachIndex = 0;
         }
     tachTickPrev = tachNow;
+    EXT_INT0_ticks = (int16_t) (GetTimerTick() - tachNow);
     }
 
-const int32_t ticksPerMinute = 60*TicksPerSecond;
+int16_t peakRPM = 0;
 
 int16_t GetMotorRPM()
     {
-    // Effectively zero
-    if (tachTicksRollingAverage > 2*TicksPerSecond)
-        {
-        return 0;
-        }
-
     // If there hasn't been a tachTick in a long while it's effectively zero.
     if ((tachCount == 0) || (GetTimerTickChange(tachTickPrev) > 2*TicksPerSecond))
         {
             return 0;
         }
-    
+#if defined(USE_RPMS)
+    return tachRPMsRollingAverage;
+#elif defined(USE_TICKS)    
     int32_t rpm = ticksPerMinute / tachTicksRollingAverage;
     
     return (int16_t) rpm;
+#else
+#error Must define USE_RPMS or USE_TICKS
+#endif
     }
 
 ISR(PCINT0_vect)
@@ -197,22 +226,24 @@ const int16_t MotorMaxPower = 255;
 
 uint8_t motorDirection = MOTOR_NO_DIRECTION;
 void SetMotorDirection(uint8_t direction)
-{
+    {
     if (motorDirection != direction)
         {
         motorDirection = PORTB & ~MOTOR_CONTROL_MASK;
         motorDirection |= direction;
         PORTB = motorDirection;
 
+#if defined (PID_CONTROL)
         ResetMotorPIDControl();
+#endif
         }
-}
+    }
 
 int16_t lastMotorPower;
 bool ChangeMotorPower(int16_t powerChange)
-{
+    {
     return SetMotorPower(lastMotorPower + powerChange);
-}
+    }
 
 bool SetMotorPower(int16_t power)
     {
@@ -242,29 +273,60 @@ int16_t targetRPM = 0;    // The speed we are currently targeting as we ramp the
 uint8_t stepsUntilTargetRPM = 0;  // number of incremental changes left to get to the final target speed.
 
 void SetTargetRPM(int16_t newFinalTargetRPM)
-{
+    {
     finalTargetRPM = newFinalTargetRPM;
     stepsUntilTargetRPM = 1;
     targetRPM = (finalTargetRPM / stepsUntilTargetRPM);  // This is the first step.
     stepsUntilTargetRPM--;
-}
+    }
 
 int16_t MotorPowerForRPM(int16_t rpm)
-{
+    {
     return (int16_t)(((int32_t) rpm)*MotorMaxPower/MotorMaxRPM);
-}
+    }
 
 int32_t timeoutTicks = 0;
 bool IsActive()
-{
+    {
     return !IsTimeout(timeoutTicks);
-}
+    }
 void Active(int32_t now)
-{
+    {
     timeoutTicks = now + TicksPerSecond*10;
-}
+    }
 
-#if defined(CAPTURE_RPM)
+struct Debouncer
+    {
+    bool debouncing;
+    bool prevState;
+    int32_t timeout;
+    };
+ 
+ void InitDebouncer(struct Debouncer *d, bool initialState)
+     {
+     d->debouncing = false;
+     d->prevState = initialState;
+     d->timeout = 0;
+     }
+ 
+ bool Debounce(struct Debouncer *d, bool state)
+     {
+     if (state != d->prevState)
+         {
+         d->debouncing = true;
+         d->prevState = state;
+         d->timeout = FutureTicks(TicksPerSecond/400);   
+         }
+     else if (d->debouncing && IsTimeout(d->timeout))
+        {
+        d->debouncing = false;
+        return true;
+        }
+        
+     return false;
+     }
+ 
+ #if defined(CAPTURE_RPM)
     int16_t rpms[tachSampleCount];
 #endif
 int main(void)
@@ -297,18 +359,15 @@ int main(void)
     TIMSK1 = _BV(TOIE1);    // Enable interrupts
     
     PCMSK0 |= _BV(PCINT0); // Enable port change interrupt on PA0 (GOTO_MAXIMUM_PIN)
-    GIMSK |= PCIE0;
+    GIMSK |= _BV(PCIE0);
 
     sei();
-    
-
-    uint8_t prevTargetMaximum = 0xff;  // Start out with an invalid value
-    
+   
 #if defined(CAPTURE_RPM)
     SetMotorDirection(MOTOR_REVERSE);
     SetMotorPower(255);
 
-    int32_t stopTick = GetTimerTick() + 5*TicksPerSecond;
+    int32_t stopTick = FutureTicks(5*TicksPerSecond);
     
     while (!IsTimeout(stopTick))
         {
@@ -317,56 +376,69 @@ int main(void)
     SetMotorDirection(MOTOR_FLOAT);
     for (int i = 0; i < tachSampleCount; i++)
         {
+#if defined(USE_RPMS)
+        int32_t rpm = tachRPMs[i];
+#else
         int32_t rpm = ticksPerMinute / tachTicks[i];
+#endif
         rpms[i] = (int16_t) rpm;
         }
 #endif
     
+    struct Debouncer targetMaximumDebouncer;
+    // Initialize it to the opposite of what the pin says... so it will trigger the first time through the loop
+    InitDebouncer(&targetMaximumDebouncer, (PINA & GOTO_MAXIMUM_MASK) != 0);
+    
+    int32_t stallTimeout = FutureTicks(2*TicksPerSecond);
+    Active(GetTimerTick());
     while (1) 
         {
-        uint8_t pa = PINA;
-        uint8_t targetMaximum = (pa & GOTO_MAXIMUM_MASK) == 0;
+        uint8_t targetMaximum = (PINA & GOTO_MAXIMUM_MASK) == 0;
         uint8_t atMaximum = false;
         uint8_t atMinimum = false;
 
-        if (targetMaximum != prevTargetMaximum)
-            {
-            prevTargetMaximum = targetMaximum;
+        if (Debounce(&targetMaximumDebouncer, targetMaximum))
+            {            
             if (targetMaximum && !atMaximum)
                 {
                 // Want to drive the motor towards maximum limit.
                 SetMotorDirection(MOTOR_FORWARD);
                 SetTargetRPM(MotorMaxRPM);
-                SetMotorPower(MotorPowerForRPM(MotorMaxRPM));
                 atMinimum = false;  // We're driving the motor away from the minimum.
                 }
             else if (!targetMaximum && !atMinimum)
                 {
                 // Want to drive the motor towards minimum limit.
                 SetMotorDirection(MOTOR_REVERSE);
-                SetTargetRPM(MotorMaxRPM);
-                SetMotorPower(MotorPowerForRPM(MotorMaxRPM));
                 atMaximum = false;  // We're driving the motor away from the maximum.
                 }
+            SetTargetRPM(MotorMaxRPM);
+            stallTimeout = FutureTicks(TicksPerSecond/2);
+            SetTargetRPM(MotorMaxRPM);
             }
             
-        if (!IsActive() && (GetMotorRPM() == 0))
-            {
-#if 0
-            // Sleep the processor to save power.
-            // It will wake up when the PCINT0 pin changes.
-            cli();
-            sleep_enable();
-            sleep_bod_disable(); // disable brown out detect
-            sei(); // next instruction (sleep_cpu()) is guaranteed to execute before interrupts are enabled.
-            sleep_cpu();
-            sleep_disable();
-#endif
-            }
-
         if (targetRPM > 0)
             {
-            if (MotorPIDControl() == 0)
+            Active(GetTimerTick());
+            bool stalled = false;
+            int16_t rpm = GetMotorRPM();
+            if (rpm < 10)
+                {
+                if (IsTimeout(stallTimeout))
+                    {
+                    stalled = true;    
+                    }
+                }
+            else
+                {
+                stallTimeout = FutureTicks(TicksPerSecond/2);
+                }
+#if !defined(PID_CONTROL)
+            SetMotorPower(MotorPowerForRPM(targetRPM));
+#else
+            MotorPIDControl(rpm);
+#endif
+            if (stalled)
                 {
                 // Motor stalled... must have reached the end stop.
                 atMaximum = targetMaximum;
@@ -376,9 +448,27 @@ int main(void)
                 SetTargetRPM(0);
                 }
             }
+            
+        if (!IsActive() && (GetMotorRPM() == 0))
+            {
+#if defined(ENABLE_SLEEP)
+            // Sleep the processor to save power.
+            // It will wake up when the PCINT0 pin changes.
+            cli();
+            TIMSK1 &= ~_BV(TOIE1);    // Enable interrupts
+            sleep_enable();
+            sleep_bod_disable(); // disable brown out detect
+            sei(); // next instruction (sleep_cpu()) is guaranteed to execute before interrupts are enabled.
+            sleep_cpu();
+            sleep_disable();
+           TIMSK1 |= _BV(TOIE1);    // Enable interrupts
+           Active(GetTimerTick());
+#endif
+            }
         }
     }
 
+#if defined(PID_CONTROL)
 // PID co-efficients expressed as fractions (e.g. Kp = Kpn/Kpd)    
 int16_t Kpn = 0;    // Kp = 1/2
 int16_t Kpd = 2;
@@ -392,7 +482,6 @@ int16_t prevError = 0;
 int32_t nextPIDTicks = 0;
 int32_t nextRPMBoostTicks = 0;
 uint8_t overpowerCount = 0;
-int16_t maxRPM = 0;
 uint8_t maxPower = 0;
 int16_t fasterCount = 0;
 int16_t slowerCount = 0;
@@ -404,7 +493,7 @@ uint8_t pidSampleIndex = 0;
 int16_t rpmChanges[PID_SAMPLES] = {0};
 int8_t powerChanges[PID_SAMPLES] = {0};
 #endif
-bool MotorPIDControl()
+void MotorPIDControl(int16_t rpm)
     {
     int32_t now = GetTimerTick();
     
@@ -424,8 +513,6 @@ bool MotorPIDControl()
                 targetRPM += deltaRPM;                
                 }
             }            
-
-        int16_t rpm = GetMotorRPM();
         int16_t error = targetRPM - rpm;
         
         if (rpm > targetRPM)
@@ -436,12 +523,10 @@ bool MotorPIDControl()
             {
             slowerCount++;
             }                    
-        if (rpm > maxRPM)
-            rpm = maxRPM;
-            
-        if ((maxRPM > finalTargetRPM/2) && (rpm < finalTargetRPM/2))
-            return false;
-        
+
+        if (rpm > peakRPM)
+            peakRPM = rpm;
+           
         int16_t derivative = prevError - error;
 
         integral += error;
@@ -449,30 +534,20 @@ bool MotorPIDControl()
         int16_t rpmChange = Kpn*error/Kpd + Kin*integral/Kid + Kdn*derivative/Kdd;
         
         // Scale from RPM to power
-        //int16_t powerChange = (int16_t)(((int32_t) rpmChange)*((int32_t)(MotorMaxPower - MotorMinPower))/(int32_t)(MotorMaxRPM - 0));
-        int16_t powerChange = MotorPowerForRPM(rpmChange);
+        int16_t powerChange = 0; //MotorPowerForRPM(rpmChange);
 
 #if defined(CAPTURE_PID)
         rpmChanges[pidSampleIndex] = rpmChange;
         powerChanges[pidSampleIndex] = powerChange;
         pidSampleIndex++;
-        if (pidSampleIndex >= ARRAY_COUNT(rpmChanges))
+        if (pidSampleIndex >= PID_SAMPLES)
            {
            pidSampleIndex = 0;
            }
 #endif        
 
-        if (!ChangeMotorPower(powerChange))
-            {
-            overpowerCount++;
-            
-            return true; // (overpowerCount > 10) ? false : true;
-            }
-
-        overpowerCount = 0;
+        ChangeMotorPower(powerChange);
         }
-        
-    return true;
     }
 
 void ResetMotorPIDControl()
@@ -481,10 +556,11 @@ void ResetMotorPIDControl()
     nextRPMBoostTicks = 0;
     integral = 0;
     prevError = 0;
-    maxRPM = 0;
+    peakRPM = 0;
     maxPower = 0;
     fasterCount = 0;
     slowerCount = 0;
     int32_t now = GetTimerTick();
     nextPIDTicks = now + TicksPerSecond/2;
     }
+#endif
